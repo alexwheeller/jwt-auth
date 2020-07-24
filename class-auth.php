@@ -129,6 +129,7 @@ class Auth {
 	 * @return WP_REST_Response The response.
 	 */
 	public function get_token( WP_REST_Request $request ) {
+		
 		$secret_key = defined( 'JWT_AUTH_SECRET_KEY' ) ? JWT_AUTH_SECRET_KEY : false;
 
 		$username    = $request->get_param( 'username' );
@@ -190,6 +191,7 @@ class Auth {
 			'iat'  => $issued_at,
 			'nbf'  => $not_before,
 			'exp'  => $expire,
+			'sub'  => $user->user_login,
 			'data' => array(
 				'user' => array(
 					'id' => $user->ID,
@@ -200,7 +202,7 @@ class Auth {
 		$alg = $this->get_alg();
 
 		// Let the user modify the token data before the sign.
-		$token = JWT::encode( apply_filters( 'jwt_auth_payload', $payload, $user ), $secret_key, $alg );
+		$token = JWT::encode( apply_filters( 'jwt_auth_payload', $payload, $user ), base64_decode($secret_key), $alg );
 
 		// If return as raw token string.
 		if ( $return_raw ) {
@@ -245,7 +247,7 @@ class Auth {
 	 * @return string $alg
 	 */
 	public function get_alg() {
-		return apply_filters( 'jwt_auth_alg', 'HS256' );
+		return apply_filters( 'jwt_auth_alg', 'HS512' ); //HS256
 	}
 
 	/**
@@ -272,12 +274,24 @@ class Auth {
 	 *
 	 * @return WP_REST_Response | Array Returns WP_REST_Response or token's $payload.
 	 */
-	public function validate_token( $output = true ) {
+	public function validate_token( $output = true ) {		
 		/**
 		 * Looking for the HTTP_AUTHORIZATION header, if not present just
 		 * return the user.
 		 */
-		$auth = isset( $_SERVER['HTTP_AUTHORIZATION'] ) ? $_SERVER['HTTP_AUTHORIZATION'] : false;
+//		$auth = isset( $_SERVER['HTTP_AUTHORIZATION'] ) ? $_SERVER['HTTP_AUTHORIZATION'] : false;
+		$auth = isset( $_SERVER['HTTP_X_AUTH_TOKEN'] ) ? $_SERVER['HTTP_X_AUTH_TOKEN'] : false;
+		
+		/*error_log( print_r($auth, TRUE) );
+		
+		$headers = array();
+		foreach ($_SERVER as $key => $value) {
+		    if (strpos($key, 'HTTP_') === 0) {
+				$headers[$key] = $value;
+		    }
+		}
+		
+		error_log(print_r($headers, TRUE) );*/
 
 		// Double check for different auth header string (server dependent).
 		if ( ! $auth ) {
@@ -285,6 +299,7 @@ class Auth {
 		}
 
 		if ( ! $auth ) {
+			error_log('no auth');
 			return new WP_REST_Response(
 				array(
 					'success'    => false,
@@ -331,25 +346,28 @@ class Auth {
 
 		// Try to decode the token.
 		try {
+			JWT::$leeway = 60;
 			$alg     = $this->get_alg();
-			$payload = JWT::decode( $token, $secret_key, array( $alg ) );
-
-			// The Token is decoded now validate the iss.
-			if ( $payload->iss !== $this->get_iss() ) {
-				// The iss do not match, return error.
+			
+			$payload = JWT::decode( $token, base64_decode($secret_key), array( $alg ) );
+			
+			error_log(print_r($payload, TRUE));
+			
+			// The Token is decoded now validate time.
+			if ( $payload->exp < time() ) {
 				return new WP_REST_Response(
 					array(
 						'success'    => false,
 						'statusCode' => 403,
-						'code'       => 'jwt_auth_bad_iss',
-						'message'    => __( 'The iss do not match with this server.', 'jwt-auth' ),
+						'code'       => 'jwt_auth_token_expired',
+						'message'    => __( 'Token expired.', 'jwt-auth' ),
 						'data'       => array(),
 					)
 				);
 			}
 
 			// Check the user id existence in the token.
-			if ( ! isset( $payload->data->user->id ) ) {
+			if ( ! isset( $payload->sub ) ) {
 				// No user id in the token, abort!!
 				return new WP_REST_Response(
 					array(
@@ -363,8 +381,8 @@ class Auth {
 			}
 
 			// So far so good, check if the given user id exists in db.
-			$user = get_user_by( 'id', $payload->data->user->id );
-
+			$user = get_user_by( 'login', $payload->sub );
+			
 			if ( ! $user ) {
 				// No user id in the token, abort!!
 				return new WP_REST_Response(
@@ -388,11 +406,15 @@ class Auth {
 				'statusCode' => 200,
 				'code'       => 'jwt_auth_valid_token',
 				'message'    => __( 'Token is valid', 'jwt-auth' ),
-				'data'       => array(),
+				'data' => array(
+					'user' => array('id' => $user->ID,),
+//					'payload' => $payload,
+				),
 			);
 
 			$response = apply_filters( 'jwt_auth_valid_token_response', $response, $user, $token, $payload );
-
+			
+			
 			// Otherwise, return success response.
 			return new WP_REST_Response( $response );
 		} catch ( Exception $e ) {
@@ -441,17 +463,21 @@ class Auth {
 			return $user_id;
 		}
 
-		$payload = $this->validate_token( false );
-
+//		$payload = $this->validate_token( false );
+		$response = $this->validate_token( true );
+		
 		// If $payload is an error response, then return the default $user_id.
-		if ( $this->is_error_response( $payload ) ) {
-			if ( 'jwt_auth_no_auth_header' === $payload->data['code'] ||
-				'jwt_auth_bad_auth_header' === $payload->data['code']
+		if ( $this->is_error_response( $response ) ) {
+			error_log('1');
+			if ( 'jwt_auth_no_auth_header' === $response->data['code'] ||
+				'jwt_auth_bad_auth_header' === $response->data['code']
 			) {
 				$request_uri   = $_SERVER['REQUEST_URI'];
-				$rest_api_slug = home_url( '/' . $this->rest_api_slug, 'relative' );
+				$rest_api_slug = home_url( '/index.php/' . $this->rest_api_slug, 'relative' );
 
-				if ( $rest_api_slug . '/jwt-auth/v1/token' !== $request_uri ) {
+//				//				if ( $rest_api_slug . '/jwt-auth/v1/token' !== $request_uri ) {
+				$excluded = $rest_api_slug . '/jwt-auth/v1/token';
+				if ( stripos( $request_uri, $excluded ) !== 0 ) {	
 					// Whitelist some endpoints by default (without trailing * char).
 					$default_whitelist = array(
 						// WooCommerce namespace.
@@ -461,6 +487,8 @@ class Auth {
 
 						// WordPress namespace.
 						$rest_api_slug . '/wp/v2/',
+						
+						//$rest_api_slug . '/mprm/v1/',
 					);
 
 					// Well, we let you adjust this default whitelist :).
@@ -478,19 +506,20 @@ class Auth {
 
 					if ( ! $is_ignored ) {
 						if ( ! $this->is_whitelisted() ) {
-							$this->jwt_error = $payload;
+							$this->jwt_error = $response;
 						}
 					}
 				}
 			} else {
-				$this->jwt_error = $payload;
+				$this->jwt_error = $response;
 			}
 
 			return $user_id;
 		}
-
+		
 		// Everything is ok here, return the user ID stored in the token.
-		return $payload->data->user->id;
+		//return $payload->data->user->id;
+		return $response->data['data']['user']['id'];
 	}
 
 	/**
@@ -554,11 +583,11 @@ class Auth {
 		if ( $this->is_error_response( $this->jwt_error ) ) {
 			return $this->jwt_error;
 		}
-
+		
 		if ( empty( $result ) ) {
 			return $result;
 		}
-
+		
 		return $result;
 	}
 }
